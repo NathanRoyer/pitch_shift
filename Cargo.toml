@@ -1,0 +1,11 @@
+[package]
+edition = "2021"
+name = "mundia-test"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+microfft = { version = "0.6", features = ["size-1024", "bitrev-tables"] }
+micromath = { version = "2.1" }
+# static_cell = "2.1"
+hound = "3.5"
