@@ -17,8 +17,11 @@ defmt-rtt = "0.4"
 defmt = "0.3"
 log = "0.4"
 
-microfft = { version = "0.6", features = ["size-1024", "bitrev-tables"] }
+microfft = { version = "0.6", default-features = false, features = ["size-1024"] }
 micromath = { version = "2.1" }
+fixed = "1.29"
+
+arrayvec = { version = "0.7", default-features = false }
 
 [profile.release]
 debug = 2

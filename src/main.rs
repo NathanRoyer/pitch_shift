@@ -9,34 +9,39 @@ use log::{info};
 use embassy_time::{Timer, Instant};
 use embassy_executor::Executor;
 
+use embassy_rp::Peripheral;
 use embassy_rp::clocks::{rosc_freq, xosc_freq, clk_sys_freq};
 use embassy_rp::multicore::{spawn_core1, Stack};
-use embassy_rp::usb::{Driver, InterruptHandler};
-use embassy_rp::peripherals::USB;
+use embassy_rp::peripherals::{self, USB, I2C0, PIO0};
+use embassy_rp::gpio::{Level, Output, Input, Pull};
+use embassy_rp::adc::{self, Adc, Channel};
 use embassy_rp::bind_interrupts;
 use embassy_rp::config::Config;
-use embassy_rp::gpio;
+use embassy_rp::i2c;
+use embassy_rp::usb;
+use embassy_rp::pio;
 
 use static_cell::{StaticCell, ConstStaticCell};
+use arrayvec::ArrayVec;
 
-use gpio::{Level, Output};
 use {defmt_rtt as _, panic_probe as _};
 
-use shift::{PitchShifter, SHIFTER_INIT};
-
-mod shift;
+mod audio_out;
+mod keyboard;
+// mod shift;
 mod cfg;
 
 bind_interrupts!(struct Irqs {
-    USBCTRL_IRQ => InterruptHandler<USB>;
+    USBCTRL_IRQ => usb::InterruptHandler<USB>;
+    I2C0_IRQ => i2c::InterruptHandler<I2C0>;
+    ADC_IRQ_FIFO => adc::InterruptHandler;
+    PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
 });
 
-static SHIFTER: ConstStaticCell<PitchShifter> = ConstStaticCell::new(SHIFTER_INIT);
+const INIT_BUF: [f32; 44100] = [0.0; 44100];
 
-const INIT_BUF: [f32; 1024] = [0.0; 1024];
-
-static IBUF: ConstStaticCell<[f32; 1024]> = ConstStaticCell::new(INIT_BUF);
-static OBUF: ConstStaticCell<[f32; 1024]> = ConstStaticCell::new(INIT_BUF);
+// static IBUF: ConstStaticCell<[f32; 44100]> = ConstStaticCell::new(INIT_BUF);
+// static OBUF: ConstStaticCell<[f32; 44100]> = ConstStaticCell::new(INIT_BUF);
 
 static CORE1_STACK: ConstStaticCell<Stack<4096>> = ConstStaticCell::new(Stack::new());
 static EXECUTOR0: StaticCell<Executor> = StaticCell::new();
@@ -44,11 +49,36 @@ static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 
 #[cortex_m_rt::entry]
 fn main() -> ! {
-    let _config = Config::new(cfg::clock_config());
-    let p = embassy_rp::init(Default::default());
+    let config = Config::new(cfg::clock_config());
+    let p = embassy_rp::init(config);
 
-    let driver = Driver::new(p.USB, Irqs);
+    // LED / SERIAL INIT
+
+    let driver = usb::Driver::new(p.USB, Irqs);
     let led = Output::new(p.PIN_25, Level::Low);
+
+    // KEYBOARD TASK INIT
+
+    let kb_map = keyboard::KeyboardMap {
+        menu_2: Input::new(p.PIN_20, Pull::None),
+        menu_14: Input::new(p.PIN_9, Pull::None),
+        menu_15: Input::new(p.PIN_8, Pull::None),
+        menu_16: Input::new(p.PIN_7, Pull::None),
+
+        note_1: Input::new(p.PIN_21, Pull::None),
+        note_2: Input::new(p.PIN_6, Pull::None),
+        note_3: Input::new(p.PIN_10, Pull::None),
+        note_4: Input::new(p.PIN_15, Pull::None),
+        note_5: Input::new(p.PIN_14, Pull::None),
+
+        adc_p1: Channel::new_pin(p.PIN_40, Pull::None),
+        adc_p2: Channel::new_pin(p.PIN_41, Pull::None),
+        adc: Adc::new(p.ADC, Irqs, Default::default()),
+    };
+
+    let kb_task = keyboard::kb_test(p.I2C0, p.PIN_17, p.PIN_16, kb_map);
+
+    // EXECUTOR INIT
 
     let core1_thread = move || {
         let executor1 = EXECUTOR1.init(Executor::new());
@@ -61,30 +91,30 @@ fn main() -> ! {
     let executor0 = EXECUTOR0.init(Executor::new());
     executor0.run(|spawner| {
         spawner.spawn(core0_task()).unwrap();
+        spawner.spawn(kb_task).unwrap();
         spawner.spawn(logger_task(driver)).unwrap();
     });
 }
 
 #[embassy_executor::task]
 async fn core1_task(mut led: Output<'static>) {
-    let shifter = SHIFTER.take();
-    shifter.init(48000);
     sleep_ms(1000).await;
 
     log::info!("hello! rfreq = {}, xfreq = {}, sys = {}", rosc_freq(), xosc_freq(), clk_sys_freq());
     sleep_ms(1).await;
 
-    let ibuf = IBUF.take();
-    let obuf = OBUF.take();
+    // let ibuf = IBUF.take();
+    // let obuf = OBUF.take();
 
     // Do stuff with the class!
     loop {
         let then = Instant::now();
 
         // big compute
-        shifter.shift_pitch(16, 12.0, ibuf, obuf).await;
+        // shift::shift(ibuf, obuf, 0.0, 44100.0);
 
         let elapsed = then.elapsed();
+        sleep_ms(10).await;
         info!("took {}ms", elapsed.as_millis());
         tick_n(1, &mut led).await;
     }
@@ -105,9 +135,9 @@ async fn tick_n(n: usize, led: &mut Output<'_>) {
 
     for _i in 0..n {
         led.set_high();
-        sleep_ms(200).await;
+        sleep_ms(1).await;
         led.set_low();
-        sleep_ms(800).await;
+        sleep_ms(999).await;
     }
 
     if n > 1 {
@@ -119,8 +149,12 @@ async fn sleep_ms(num: u64) {
     Timer::after_millis(num).await;
 }
 
+async fn sleep_us(num: u64) {
+    Timer::after_micros(num).await;
+}
+
 #[embassy_executor::task]
-async fn logger_task(driver: Driver<'static, USB>) {
+async fn logger_task(driver: usb::Driver<'static, USB>) {
     use log::{LevelFilter, Record};
     use embassy_usb_logger::*;
     use core::fmt::Write;

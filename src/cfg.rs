@@ -3,8 +3,11 @@ use embassy_rp::clocks::*;
 pub fn clock_config() -> ClockConfig {
     let mut cfg = ClockConfig::rosc();
 
+    // 180_633_600 = 180 MHz
+    let main_clk = 44100 * 2048 * 2;
+
     cfg.rosc = Some(RoscConfig {
-        hz: 140_000_000,
+        hz: main_clk,
         range: RoscRange::High,
         drive_strength: [0; 8],
         div: 1,
@@ -42,8 +45,8 @@ pub fn clock_config() -> ClockConfig {
     });
 
     cfg.adc_clk = Some(AdcClkConfig {
-        src: AdcClkSrc::Rosc,
-        div: 3,
+        src: AdcClkSrc::PllUsb,
+        div: 1,
         phase: 0,
     });
 
