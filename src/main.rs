@@ -5,8 +5,9 @@
 #![no_std]
 #![no_main]
 
-use log::{info};
-use embassy_time::{Timer, Instant};
+use embassy_time::Timer;
+use embassy_sync::mutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_executor::Executor;
 
 use embassy_rp::Peripheral;
@@ -21,15 +22,21 @@ use embassy_rp::i2c;
 use embassy_rp::usb;
 use embassy_rp::pio;
 
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use static_cell::{StaticCell, ConstStaticCell};
 use arrayvec::ArrayVec;
 
 use {defmt_rtt as _, panic_probe as _};
 
+#[allow(unused)]
+use cfg::{SAMPLE_RATE, SAMPLE_BITS, RESOLUTION};
+
 mod audio_out;
 mod keyboard;
 // mod shift;
 mod cfg;
+
+type Mutex<T> = mutex::Mutex<CriticalSectionRawMutex, T>;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => usb::InterruptHandler<USB>;
@@ -38,14 +45,14 @@ bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
 });
 
-const INIT_BUF: [f32; 44100] = [0.0; 44100];
-
-// static IBUF: ConstStaticCell<[f32; 44100]> = ConstStaticCell::new(INIT_BUF);
-// static OBUF: ConstStaticCell<[f32; 44100]> = ConstStaticCell::new(INIT_BUF);
-
 static CORE1_STACK: ConstStaticCell<Stack<4096>> = ConstStaticCell::new(Stack::new());
 static EXECUTOR0: StaticCell<Executor> = StaticCell::new();
 static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
+
+static NOTES_L: AtomicU32 = AtomicU32::new(0);
+static NOTES_H: AtomicU32 = AtomicU32::new(0);
+static FADER_A: AtomicU8 = AtomicU8::new(0);
+static FADER_B: AtomicU8 = AtomicU8::new(0);
 
 #[cortex_m_rt::entry]
 fn main() -> ! {
@@ -78,11 +85,17 @@ fn main() -> ! {
 
     let kb_task = keyboard::kb_test(p.I2C0, p.PIN_17, p.PIN_16, kb_map);
 
+    // AUDIO OUT TASKS
+
+    let pio = pio::Pio::new(p.PIO0, Irqs);
+    let dma_task = audio_out::dma_forward_task(pio, p.DMA_CH0, p.PIN_22);
+    let gen_task = audio_out::audio_gen_task();
+
     // EXECUTOR INIT
 
     let core1_thread = move || {
         let executor1 = EXECUTOR1.init(Executor::new());
-        executor1.run(|spawner| spawner.spawn(core1_task(led)).unwrap());
+        executor1.run(|spawner| spawner.spawn(debug_task(led)).unwrap());
     };
 
     let core1_stack = CORE1_STACK.take();
@@ -90,41 +103,23 @@ fn main() -> ! {
 
     let executor0 = EXECUTOR0.init(Executor::new());
     executor0.run(|spawner| {
-        spawner.spawn(core0_task()).unwrap();
         spawner.spawn(kb_task).unwrap();
+        spawner.spawn(dma_task).unwrap();
+        spawner.spawn(gen_task).unwrap();
         spawner.spawn(logger_task(driver)).unwrap();
     });
 }
 
 #[embassy_executor::task]
-async fn core1_task(mut led: Output<'static>) {
+async fn debug_task(mut led: Output<'static>) {
     sleep_ms(1000).await;
 
     log::info!("hello! rfreq = {}, xfreq = {}, sys = {}", rosc_freq(), xosc_freq(), clk_sys_freq());
     sleep_ms(1).await;
 
-    // let ibuf = IBUF.take();
-    // let obuf = OBUF.take();
-
-    // Do stuff with the class!
     loop {
-        let then = Instant::now();
-
-        // big compute
-        // shift::shift(ibuf, obuf, 0.0, 44100.0);
-
-        let elapsed = then.elapsed();
         sleep_ms(10).await;
-        info!("took {}ms", elapsed.as_millis());
         tick_n(1, &mut led).await;
-    }
-}
-
-#[embassy_executor::task]
-async fn core0_task() {
-    // info!("Hello from core 0");
-    loop {
-        sleep_ms(1000).await;
     }
 }
 

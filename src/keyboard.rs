@@ -115,15 +115,32 @@ pub async fn kb_test(
         let a = adc_map(kb_map.adc.read(&mut kb_map.adc_p1).await.ok(), 3200, 4076);
         let b = adc_map(kb_map.adc.read(&mut kb_map.adc_p2).await.ok(), 3140, 4076);
 
-        // log::info!("ADC:      {a:.2}     {b:.2}");
+        FADER_A.store((a * 255.0) as u8, Ordering::Relaxed);
+        FADER_B.store((b * 255.0) as u8, Ordering::Relaxed);
 
         for i in 0..8 {
             keyboard_pass(&kb_map, bus, i, &mut notes, &mut buttons).await;
         }
 
-        log::warn!("{:?} {:?}", notes, buttons);
+        let mut l = 0u32;
+        let mut h = 0u32;
+
+        for note in &notes {
+            let (dst, i) = match *note < 32 {
+                true => (&mut l, *note),
+                false => (&mut h, note - 32),
+            };
+
+            *dst |= 1 << i;
+        }
+
+        NOTES_L.store(l, Ordering::Relaxed);
+        NOTES_H.store(h, Ordering::Relaxed);
+
+        log::info!("{a:.2} | {b:.2} | {:?} {:?}", notes, buttons);
         notes.clear();
         buttons.clear();
+        sleep_us(10).await;
     }
 }
 

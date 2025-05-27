@@ -1,10 +1,22 @@
 use embassy_rp::clocks::*;
+// use core::time::Duration;
+
+pub const SAMPLE_RATE: u32 = 44100;
+pub const SAMPLE_BITS: u32 = 11;
+pub const RESOLUTION: u32 = 2u32.pow(SAMPLE_BITS);
+
+/*
+pub fn duration_to_points(duration: Duration) -> u32 {
+    (duration.as_secs_f64() * (SAMPLE_RATE as f64)) as u32
+}
+*/
 
 pub fn clock_config() -> ClockConfig {
     let mut cfg = ClockConfig::rosc();
 
     // 180_633_600 = 180 MHz
-    let main_clk = 44100 * 2048 * 2;
+    // 2 = PWM clock divider
+    let main_clk = SAMPLE_RATE * RESOLUTION * 2;
 
     cfg.rosc = Some(RoscConfig {
         hz: main_clk,

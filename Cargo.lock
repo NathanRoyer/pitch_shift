@@ -458,6 +458,7 @@ checksum = "8d2c8cdff05a7a51ba0087489ea44b0b1d97a296ca6b1d6d1a33ea7423d34049"
 dependencies = [
  "cfg-if",
  "critical-section",
+ "defmt 0.3.100",
  "embedded-io-async",
  "futures-sink",
  "futures-util",
@@ -867,6 +868,7 @@ dependencies = [
  "defmt-rtt",
  "embassy-executor",
  "embassy-rp",
+ "embassy-sync",
  "embassy-time",
  "embassy-usb",
  "embassy-usb-logger",

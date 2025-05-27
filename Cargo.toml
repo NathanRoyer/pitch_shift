@@ -5,13 +5,14 @@ version = "0.1.0"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-embassy-rp = { version = "0.4.0", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp235xb", "binary-info"] }
-embassy-executor = { version = "0.7.0", features = ["arch-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
-embassy-time = { version = "0.4.0", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-rp = { version = "0.4", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp235xb", "binary-info"] }
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
+embassy-time = { version = "0.4", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-sync = { version = "0.6", features = ["defmt"] }
 panic-probe = { version = "0.3", features = ["print-defmt"] }
-embassy-usb = { version = "0.4.0", features = ["defmt"] }
+embassy-usb = { version = "0.4", features = ["defmt"] }
 embassy-usb-logger = "0.4"
-cortex-m-rt = "0.7.0"
+cortex-m-rt = "0.7"
 static_cell = "2.1"
 defmt-rtt = "0.4"
 defmt = "0.3"
