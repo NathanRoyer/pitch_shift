@@ -170,7 +170,9 @@ impl PitchShifter {
                 self.fft_cplx.fill(COMPLEX_ZERO);
 
                 for k in 0..half_frame_size {
-                    self.phase_sum[k] += mean_expected * self.synthesized_frequency[k];
+                    let phase_increment = mean_expected * self.synthesized_frequency[k];
+                    self.phase_sum[k] += phase_increment;
+                    self.phase_sum[k] = self.phase_sum[k].rem_euclid(TAU);
 
                     let (sin, cos) = self.phase_sum[k].sin_cos();
                     let magnitude = self.synthesized_magnitude[k];
