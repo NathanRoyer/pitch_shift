@@ -3,7 +3,7 @@ use hound::WavReader;
 use hound::WavSpec;
 use hound::WavWriter;
 
-use pitch_shift::PitchShifter;
+use pitch_shift::{Shifter, TOTAL_F32};
 
 use pico_args::Arguments;
 
@@ -22,16 +22,27 @@ fn parse_args(args: &mut Arguments) -> Option<(String, String, f32)> {
     Some((input_file, output_file, shift))
 }
 
+type State = Box<[f32; TOTAL_F32]>;
+
+fn shifter() -> Shifter<State> {
+    let state_vec = vec![0.0; TOTAL_F32];
+    let state_box: State = state_vec.try_into().unwrap();
+    Shifter::new(state_box)
+}
+
 fn main() {
     let mut args = Arguments::from_env();
     let parsed = parse_args(&mut args);
     if let Some((input_file, output_file, shift)) = parsed {
         let (in_b, sample_rate) = read_wav(&input_file);
         let mut wav = Vec::new();
-        let mut shifter = PitchShifter::new(50, sample_rate);
-        let mut out_b = vec![0.0; in_b.len()];
-        shifter.shift_pitch(16, shift, &in_b, &mut out_b);
-        wav.extend_from_slice(&out_b);
+        let mut shifter = shifter();
+
+        for in_c in in_b.chunks_exact(128) {
+            let out_b = shifter.shift(in_c, shift, sample_rate as f32);
+            wav.extend_from_slice(&out_b);
+        }
+
         save_wav(&output_file, &wav, sample_rate);
     } else {
         println!("{}", USAGE);

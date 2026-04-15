@@ -1,201 +1,344 @@
-use rustfft::FftPlanner;
-use realfft::RealToComplexEven;
-use realfft::ComplexToRealEven;
-use realfft::RealToComplex;
-use realfft::ComplexToReal;
-use realfft::num_complex::Complex;
+#![doc = include_str!("../README.md")]
+#![no_std]
 
-use std::f32::consts::PI;
-use std::f32::consts::TAU; // = 2xPI
+use core::f32::consts::{PI, TAU, FRAC_1_PI};
+use core::mem::replace;
 
-type SampleReal = f32;
-const COMPLEX_ZERO: Complex<SampleReal> = Complex::new(0.0, 0.0);
+use microfft::Complex32;
+use micromath::F32Ext;
 
-/// See [`PitchShifter::new`] & [`PitchShifter::shift_pitch`]
-pub struct PitchShifter {
-    forward_fft: RealToComplexEven<SampleReal>,
-    inverse_fft: ComplexToRealEven<SampleReal>,
-    ffft_scratch_len: usize,
-    ifft_scratch_len: usize,
-    fft_scratch: Vec<Complex<SampleReal>>,
-    fft_real: Vec<SampleReal>,
-    fft_cplx: Vec<Complex<SampleReal>>,
+use microfft::inverse::ifft_1024 as microfft_ifft;
+use microfft::real::rfft_1024 as microfft_rfft;
+const FS: usize = 1024;
 
-    in_fifo: Vec<SampleReal>,
-    out_fifo: Vec<SampleReal>,
+const HOP: usize = 128;
+const HOP_F32: f32 = HOP as f32;
 
-    last_phase: Vec<SampleReal>,
-    phase_sum: Vec<SampleReal>,
-    windowing: Vec<SampleReal>,
-    output_accumulator: Vec<SampleReal>,
-    synthesized_frequency: Vec<SampleReal>,
-    synthesized_magnitude: Vec<SampleReal>,
+const HFS: usize = FS / 2;
+const DFS: usize = FS * 2;
+const HFS_M1: usize = HFS - 1;
+const FS_F32: f32 = FS as f32;
+const FS_M1_F32: f32 = (FS - 1) as f32;
 
-    frame_size: usize,
-    overlap: usize,
-    sample_rate: usize,
+const NEW_HOP_SLOT: usize = FS - HOP;
+
+const HAMMING_FS_IN: [f32; FS] = const_hamming::gen_hamming_fs_in();
+const HAMMING_FS_OUT: [f32; FS] = const_hamming::gen_hamming_fs_out();
+
+type Half<T> = [T; HFS];
+type Full<T> = [T; FS];
+
+struct State<'a> {
+    input: &'a mut Full<f32>,
+    hammed: &'a mut Full<f32>,
+    output: &'a mut Full<f32>,
+
+    arg_ibuf: &'a mut Half<f32>,
+    arg_obuf: &'a mut Half<f32>,
+
+    tmp_cplx: &'a mut Full<Complex32>,
+    tmp_norm: &'a mut Half<f32>,
+    tmp_freq: &'a mut Half<f32>,
 }
 
-impl PitchShifter {
-    /// Phase Vocoding works by extracting overlapping windows
-    /// from a buffer and processing them individually before
-    /// merging the results into the output buffer.
+// sum of array lengths in State (unit = f32)
+/// Total number of f32 needed for the shifter state
+pub const TOTAL_F32: usize = FS + FS + FS + HFS + HFS + DFS + HFS + HFS;
+/// Array of `TOTAL_F32` floats
+pub type RawState = [f32; TOTAL_F32];
+
+/// Pitch-shifting Interface
+pub struct Shifter<C: AsMut<RawState>> {
+    raw_state: C,
+}
+
+fn extract_n<const N: usize, T>(raw: &mut [T]) -> (&mut [T; N], &mut [T]) {
+    let (extracted, remaining) = raw.split_at_mut(N);
+    let extracted = extracted.try_into().expect("bad input slice length");
+    (extracted, remaining)
+}
+
+fn cast<C: AsMut<RawState>>(shifter: &mut Shifter<C>) -> State<'_> {
+    let raw = shifter.raw_state.as_mut();
+
+    let (input, raw) = extract_n(raw);
+    let (hammed, raw) = extract_n(raw);
+    let (output, raw) = extract_n(raw);
+
+    let (arg_ibuf, raw) = extract_n(raw);
+    let (arg_obuf, raw) = extract_n(raw);
+
+    let (tmp_cplx, raw) = extract_n::<DFS, f32>(raw);
+    let (tmp_norm, raw) = extract_n(raw);
+    let (tmp_freq, _) = extract_n(raw);
+
+    let tmp_cplx = bytemuck::cast_slice_mut(tmp_cplx);
+    let (tmp_cplx, _) = extract_n::<FS, Complex32>(tmp_cplx);
+
+    State {
+        input,
+        hammed,
+        output,
+
+        arg_ibuf,
+        arg_obuf,
+
+        tmp_cplx,
+        tmp_norm,
+        tmp_freq,
+    }
+}
+
+impl<C: AsMut<RawState>> Shifter<C> {
+    /// Constructs a new Pitch Shifter around a float container.
     ///
-    /// You must set a duration in miliseconds for these windows;
-    /// 50ms is a good value.
+    /// Usage if you have access to box/vec:
     ///
-    /// The sample rate argument must correspond to the sample
-    /// rate of the buffer(s) you will provide to
-    /// [`PitchShifter::shift_pitch`], which is how many values
-    /// correspond to one second of audio in the buffer.
-    pub fn new(window_duration_ms: usize, sample_rate: usize) -> Self {
-        let mut frame_size = sample_rate * window_duration_ms / 1000;
-        frame_size += frame_size % 2;
-        let fs_real = frame_size as SampleReal;
-
-        let double_frame_size = frame_size * 2;
-        let half_frame_size = (frame_size / 2) + 1;
-
-        let mut planner = FftPlanner::new();
-        let forward_fft = RealToComplexEven::new(frame_size, &mut planner);
-        let inverse_fft = ComplexToRealEven::new(frame_size, &mut planner);
-        let ffft_scratch_len = forward_fft.get_scratch_len();
-        let ifft_scratch_len = inverse_fft.get_scratch_len();
-        let scratch_len = ffft_scratch_len.max(ifft_scratch_len);
-
-        let mut windowing = vec![0.0; frame_size];
-        for k in 0..frame_size {
-            windowing[k] = -0.5 * (TAU * (k as SampleReal) / fs_real).cos() + 0.5;
-        }
+    /// ```rust
+    /// type State = Box<[f32; TOTAL_F32]>;
+    /// 
+    /// fn new_shifter() -> Shifter<State> {
+    ///     let state_vec = vec![0.0; TOTAL_F32];
+    ///     let state_box: State = state_vec.try_into().unwrap();
+    ///     Shifter::new(state_box)
+    /// }
+    /// ```
+    pub fn new(mut container: C) -> Self {
+        container.as_mut().fill(0.0);
 
         Self {
-            forward_fft,
-            inverse_fft,
-            ffft_scratch_len,
-            ifft_scratch_len,
-            fft_scratch: vec![COMPLEX_ZERO; scratch_len],
-            fft_real: vec![0.0; frame_size],
-            fft_cplx: vec![COMPLEX_ZERO; half_frame_size],
-
-            in_fifo: vec![0.0; frame_size],
-            out_fifo: vec![0.0; frame_size],
-
-            last_phase: vec![0.0; half_frame_size],
-            phase_sum: vec![0.0; half_frame_size],
-            windowing,
-            output_accumulator: vec![0.0; double_frame_size],
-            synthesized_frequency: vec![0.0; frame_size],
-            synthesized_magnitude: vec![0.0; frame_size],
-
-            frame_size,
-            overlap: 0,
-            sample_rate,
+            raw_state: container,
         }
     }
 
-    /// This is where the magic happens.
+    /// Shifts the pitch of 128 audio samples
     ///
-    /// The bigger `over_sampling`, the longer it will take to
-    /// process, but the better the results. I put `16` in the
-    /// `shift-wav` binary.
+    /// Panics if input is not 128-items long.
     ///
-    /// `shift` is how many semitones to apply to the buffer.
-    /// It is signed: a negative value will lower the tone and
-    /// vice-versa.
+    /// Returns a slice of 128 audio samples (pitch-shifted).
     ///
-    /// `in_b` is where the input buffer goes, and you must pass
-    /// an output buffer of the same length in `out_b`.
-    ///
-    /// Note: It's actually not magic, sadly.
-    pub fn shift_pitch(&mut self, over_sampling: usize, shift: SampleReal, in_b: &[SampleReal], out_b: &mut [SampleReal]) {
-        let shift = 2.0_f32.powf(shift / 12.0);
-        let fs_real = self.frame_size as SampleReal;
-        let half_frame_size = (self.frame_size / 2) + 1;
+    /// The heaviest operations of this method include:
+    /// - many memory moves
+    /// - many f32 multiplications
+    /// - some fast trigonometry work
+    /// - one inverse FFT
+    /// - one forward FFT
+    pub fn shift(
+        &mut self,
+        input: &[f32],
+        shift_semitones: f32,
+        sample_rate: f32,
+    ) -> &[f32] {
+        let shift_factor = 2.0_f32.powf(shift_semitones / 12.0);
 
-        let step = self.frame_size / over_sampling;
-        let bin_frequencies = self.sample_rate as SampleReal / fs_real;
-        let expected = TAU / (over_sampling as SampleReal);
-        let fifo_latency = self.frame_size - step;
+        let State {
+            input: history,
+            hammed,
+            output,
+            arg_ibuf,
+            arg_obuf,
+            tmp_cplx,
+            tmp_norm,
+            tmp_freq,
+        } = cast(self);
 
-        if self.overlap == 0 {
-            self.overlap = fifo_latency;
+        // shift sample history one hop back
+        history.copy_within(HOP..FS, 0);
+
+        // insert new sample data
+        history[NEW_HOP_SLOT..].copy_from_slice(input);
+
+        for i in 0..FS {
+            hammed[i] = history[i] * HAMMING_FS_IN[i];
         }
 
-        let pitch_weight = shift * bin_frequencies;
-        let oversamp_weight = ((over_sampling as SampleReal) / TAU) * pitch_weight;
-        let mean_expected = expected / bin_frequencies;
+        let synthetized = shift_frame(
+            hammed,
+            arg_ibuf,
+            arg_obuf,
+            tmp_cplx,
+            tmp_norm,
+            tmp_freq,
+            shift_factor,
+            sample_rate,
+        );
 
-        for i in 0..out_b.len() {
-            self.in_fifo[self.overlap] = in_b[i];
-            out_b[i] = self.out_fifo[self.overlap - fifo_latency];
-            self.overlap += 1;
-            if self.overlap >= self.frame_size {
-                self.overlap = fifo_latency;
+        // shift sample history one hop back
+        output.copy_within(HOP..FS, 0);
 
-                for k in 0..self.frame_size {
-                    self.fft_real[k] = self.in_fifo[k] * self.windowing[k];
-                }
+        // insert new output data
+        output[NEW_HOP_SLOT..].fill(0.0);
 
-                let _ = self.forward_fft.process_with_scratch(
-                    &mut self.fft_real,
-                    &mut self.fft_cplx,
-                    &mut self.fft_scratch[..self.ffft_scratch_len],
-                );//.unwrap();
-
-                self.synthesized_magnitude.fill(0.0);
-                self.synthesized_frequency.fill(0.0);
-
-                for k in 0..half_frame_size {
-                    let k_real = k as SampleReal;
-                    let index = (k_real * shift).round() as usize;
-                    if index < half_frame_size {
-                        let (magnitude, phase) = self.fft_cplx[k].to_polar();
-                        let mut delta_phase = (phase - self.last_phase[k]) - k_real * expected;
-                        // must not round here for some reason
-                        let mut qpd = (delta_phase / PI) as i64;
-
-                        if qpd >= 0 {
-                            qpd += qpd & 1;
-                        } else {
-                            qpd -= qpd & 1;
-                        }
-
-                        delta_phase -= PI * qpd as SampleReal;
-                        self.last_phase[k] = phase;
-                        self.synthesized_magnitude[index] += magnitude;
-                        self.synthesized_frequency[index] = k_real * pitch_weight + oversamp_weight * delta_phase;
-                    }
-                }
-
-                self.fft_cplx.fill(COMPLEX_ZERO);
-
-                for k in 0..half_frame_size {
-                    self.phase_sum[k] += mean_expected * self.synthesized_frequency[k];
-
-                    let (sin, cos) = self.phase_sum[k].sin_cos();
-                    let magnitude = self.synthesized_magnitude[k];
-
-                    self.fft_cplx[k].im = sin * magnitude;
-                    self.fft_cplx[k].re = cos * magnitude;
-                }
-
-                let _ = self.inverse_fft.process_with_scratch(
-                    &mut self.fft_cplx,
-                    &mut self.fft_real,
-                    &mut self.fft_scratch[..self.ifft_scratch_len],
-                );//.unwrap();
-
-                let acc_oversamp: SampleReal = 2.0 / (half_frame_size * over_sampling) as SampleReal;
-
-                for k in 0..self.frame_size {
-                    let product = self.windowing[k] * self.fft_real[k] * acc_oversamp;
-                    self.output_accumulator[k] += product / 2.0;
-                }
-
-                self.out_fifo[..step].copy_from_slice(&self.output_accumulator[..step]);
-                self.output_accumulator.copy_within(step..(step + self.frame_size), 0);
-                self.in_fifo.copy_within(step..(step + fifo_latency), 0);
-            }
+        for i in 0..FS {
+            output[i] += synthetized[i].re * HAMMING_FS_OUT[i];
         }
+
+        &output[..HOP]
+    }
+}
+
+fn shift_frame<'a>(
+    hammed: &mut Full<f32>,
+    arg_ibuf: &mut Half<f32>,
+    arg_obuf: &mut Half<f32>,
+    tmp_cplx: &'a mut Full<Complex32>,
+    tmp_norm: &mut Half<f32>,
+    tmp_freq: &mut Half<f32>,
+    shift_factor: f32,
+    sample_rate: f32,
+) -> &'a mut [Complex32; FS] {
+    const PHASE_INC: f32 = TAU * HOP_F32 / FS_F32;
+    const INV_PHASE_INC: f32 = 1.0 / PHASE_INC;
+
+    let max_freq = sample_rate * 0.5;
+    let inv_shift_factor = 1.0 / shift_factor;
+
+    // FORWARD FFT
+
+    let fft_result = microfft_rfft(hammed);
+
+    for i in 0..HFS {
+        // ENCODE
+
+        let (norm, arg) = to_polar(fft_result[i]);
+        let prev_arg = replace(&mut arg_ibuf[i], arg);
+        let delta = arg - prev_arg;
+
+        let i_f32 = i as f32;
+        let tmp = delta - i_f32 * PHASE_INC;
+        let j = wrap_angle(tmp) * INV_PHASE_INC;
+        let freq = i_f32 + j;
+
+        // storing the frequency simplifies shifting
+        tmp_norm[i] = norm;
+        tmp_freq[i] = freq;
+    }
+
+    for i in 0..HFS {
+        // SHIFT
+
+        let scaled = (i as f32) * inv_shift_factor;
+        let mut norm = interpolate(&*tmp_norm, scaled);              // these two lines: 600ms
+        let freq = interpolate(&*tmp_freq, scaled) * shift_factor;   //
+        let invalid_freq = (freq <= 0.0) | (freq >= max_freq);
+
+        if invalid_freq {
+            norm = 0.0;
+        }
+
+        // DECODE
+
+        let delta = freq * PHASE_INC;
+        let arg = arg_obuf[i] + delta;
+        arg_obuf[i] = wrap_angle(arg);
+
+        let (im, re) = F32Ext::sin_cos(arg);
+        tmp_cplx[i] = Complex32::new(re, im) * norm;
+    }
+
+    tmp_cplx[0] = Complex32::ZERO;
+    tmp_cplx[HFS_M1] = Complex32::ZERO;
+
+    // INVERSE FFT
+
+    for i in 1..HFS {
+        let j = HFS + i;
+        let k = HFS - i;
+        tmp_cplx[j] = tmp_cplx[k].conj();
+    }
+
+    microfft_ifft(tmp_cplx)
+}
+
+// linear signal interpolation
+#[inline(always)]
+fn interpolate(input: &[f32], index: f32) -> f32 {
+    let h_factor = index.fract();
+    let l_factor = 1.0 - h_factor;
+    let l_index = index.trunc() as usize;
+    let h_index = l_index + 1;
+
+    let fallback = 0.0f32;
+
+    let low = *input.get(l_index).unwrap_or(&fallback);
+    let high = *input.get(h_index).unwrap_or(&fallback);
+
+    low * l_factor + high * h_factor
+}
+
+#[inline(always)]
+#[doc(hidden)]
+pub fn to_polar(cplx: Complex32) -> (f32, f32) {
+    let norm = cplx.re.hypot(cplx.im);
+    let arg = cplx.im.atan2(cplx.re);
+    (norm, arg)
+}
+
+#[inline(always)]
+fn wrap_angle(radians: f32) -> f32 {
+    (radians + PI).rem_euclid(TAU) - PI
+}
+
+mod const_hamming {
+    use super::*;
+
+    /// Returns the largest integer less than or equal to a number.
+    // Stolen from micromath, turned const
+    const fn floor(x: f32) -> f32 {
+        let mut res = (x as i32) as f32;
+
+        if x < res {
+            res -= 1.0;
+        }
+
+        res
+    }
+
+    // Approximates `cos(x)` in radians with a maximum error of `0.002`.
+    // Stolen from micromath, turned const
+    const fn cos_approx(mut x: f32) -> f32 {
+        x *= FRAC_1_PI / 2.0;
+        x -= 0.25 + floor(x + 0.25);
+        x *= 16.0 * (x.abs() - 0.5);
+        x += 0.225 * x * (x.abs() - 1.0);
+        x
+    }
+
+    #[inline(always)]
+    const fn hamming(i: f32) -> f32 {
+        0.5 - 0.5 * cos_approx(i * TAU)
+    }
+
+    pub const fn gen_hamming_fs_in() -> [f32; FS] {
+        let mut out = [0.0; FS];
+
+        let mut i = 0;
+        while i < FS {
+            out[i] = hamming(i as f32 / FS_M1_F32);
+            i += 1;
+        }
+
+        out
+    }
+
+    pub const fn gen_hamming_fs_out() -> [f32; FS] {
+        let hamming = gen_hamming_fs_in();
+        let mut out = [0.0; FS];
+        let mut sq_sum = 0.0;
+
+        let mut i = 0;
+        while i < FS {
+            let tmp = hamming[i];
+            sq_sum += tmp * tmp;
+            i += 1;
+        }
+
+        let mut i = 0;
+        while i < FS {
+            out[i] = (hamming[i] * HOP_F32) / sq_sum;
+            i += 1;
+        }
+
+        out
     }
 }
