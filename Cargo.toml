@@ -1,9 +1,9 @@
 [package]
 name = "pitch_shift"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 authors = [ "Nathan ROYER <nathan.royer.pro@gmail.com>" ]
-description = "pitch-shifting using the phase vocoder technique"
+description = "pitch-shifting and/or time-stretching audio using the phase vocoder technique"
 license = "MIT"
 categories = [ "algorithms", "multimedia::audio", "command-line-utilities" ]
 repository = "https://github.com/NathanRoyer/pitch_shift"

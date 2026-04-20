@@ -9,9 +9,11 @@ The library was initially a port of <https://github.com/cpuimage/pitchshift/>.
 It implementes the "Phase Vocoder" technique which shifts the pitch without stretching
 the recording and without bringing in too many artifacts (though some are still present).
 
+Using the `out_samples` parameter, users can also slow down or accelerate the sound (without altering the pitch).
+
 It exposes one type, `Shifter`, which allows you to shift the pitch of audio buffers.
 It's up to you to bring the audio (128 samples at a time), maybe from a file or from your computer's microphone.
-Its latency is fixed to 896 samples.
+Its latency is fixed to `1024 - out_samples` samples.
 
 See <https://docs.rs/pitch_shift> for documentation.
 

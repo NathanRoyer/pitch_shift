@@ -39,7 +39,8 @@ fn main() {
         let mut shifter = shifter();
 
         for in_c in in_b.chunks_exact(128) {
-            let out_b = shifter.shift(in_c, shift, sample_rate as f32);
+            let out_samples = 128; // no speed modification
+            let out_b = shifter.shift(in_c, shift, out_samples, sample_rate as f32);
             wav.extend_from_slice(&out_b);
         }
 

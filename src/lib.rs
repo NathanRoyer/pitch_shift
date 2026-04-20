@@ -11,8 +11,8 @@ use microfft::inverse::ifft_1024 as microfft_ifft;
 use microfft::real::rfft_1024 as microfft_rfft;
 const FS: usize = 1024;
 
-const HOP: usize = 128;
-const HOP_F32: f32 = HOP as f32;
+const IN_HOP: usize = 128;
+const IN_HOP_F32: f32 = IN_HOP as f32;
 
 const HFS: usize = FS / 2;
 const DFS: usize = FS * 2;
@@ -20,7 +20,7 @@ const HFS_M1: usize = HFS - 1;
 const FS_F32: f32 = FS as f32;
 const FS_M1_F32: f32 = (FS - 1) as f32;
 
-const NEW_HOP_SLOT: usize = FS - HOP;
+const IN_LAST_HOP: usize = FS - IN_HOP;
 
 const HAMMING_FS_IN: [f32; FS] = const_hamming::gen_hamming_fs_in();
 const HAMMING_FS_OUT: [f32; FS] = const_hamming::gen_hamming_fs_out();
@@ -113,9 +113,11 @@ impl<C: AsMut<RawState>> Shifter<C> {
 
     /// Shifts the pitch of 128 audio samples
     ///
-    /// Panics if input is not 128-items long.
+    /// The speed factor is given by `128 / out_samples`. Use this to slow down or accelerate the recording.
     ///
-    /// Returns a slice of 128 audio samples (pitch-shifted).
+    /// Panics if input is not 128-items long or if `out_samples` >= 1024.
+    ///
+    /// Returns a slice of `out_samples` audio samples (pitch-shifted).
     ///
     /// The heaviest operations of this method include:
     /// - many memory moves
@@ -127,9 +129,12 @@ impl<C: AsMut<RawState>> Shifter<C> {
         &mut self,
         input: &[f32],
         shift_semitones: f32,
+        out_samples: usize,
         sample_rate: f32,
     ) -> &[f32] {
         let shift_factor = 2.0_f32.powf(shift_semitones / 12.0);
+        let out_hop_f32 = out_samples as f32;
+        let out_last_hop = FS - out_samples;
 
         let State {
             input: history,
@@ -143,10 +148,10 @@ impl<C: AsMut<RawState>> Shifter<C> {
         } = cast(self);
 
         // shift sample history one hop back
-        history.copy_within(HOP..FS, 0);
+        history.copy_within(IN_HOP..FS, 0);
 
         // insert new sample data
-        history[NEW_HOP_SLOT..].copy_from_slice(input);
+        history[IN_LAST_HOP..].copy_from_slice(input);
 
         for i in 0..FS {
             hammed[i] = history[i] * HAMMING_FS_IN[i];
@@ -160,20 +165,21 @@ impl<C: AsMut<RawState>> Shifter<C> {
             tmp_norm,
             tmp_freq,
             shift_factor,
+            out_hop_f32,
             sample_rate,
         );
 
         // shift sample history one hop back
-        output.copy_within(HOP..FS, 0);
+        output.copy_within(out_samples..FS, 0);
 
         // insert new output data
-        output[NEW_HOP_SLOT..].fill(0.0);
+        output[out_last_hop..].fill(0.0);
 
         for i in 0..FS {
-            output[i] += synthetized[i].re * HAMMING_FS_OUT[i];
+            output[i] += synthetized[i].re * HAMMING_FS_OUT[i] * out_hop_f32;
         }
 
-        &output[..HOP]
+        &output[..out_samples]
     }
 }
 
@@ -185,10 +191,14 @@ fn shift_frame<'a>(
     tmp_norm: &mut Half<f32>,
     tmp_freq: &mut Half<f32>,
     shift_factor: f32,
+    out_hop_f32: f32,
     sample_rate: f32,
 ) -> &'a mut [Complex32; FS] {
-    const PHASE_INC: f32 = TAU * HOP_F32 / FS_F32;
-    const INV_PHASE_INC: f32 = 1.0 / PHASE_INC;
+    const IN_PHASE_INC: f32 = IN_HOP_F32 * TAU / FS_F32;
+    const INV_PHASE_INC: f32 = 1.0 / IN_PHASE_INC;
+    const OUT_PHASE_FACTOR: f32 = TAU / FS_F32;
+
+    let out_phase_inc = out_hop_f32 * OUT_PHASE_FACTOR;
 
     let max_freq = sample_rate * 0.5;
     let inv_shift_factor = 1.0 / shift_factor;
@@ -205,7 +215,7 @@ fn shift_frame<'a>(
         let delta = arg - prev_arg;
 
         let i_f32 = i as f32;
-        let tmp = delta - i_f32 * PHASE_INC;
+        let tmp = delta - i_f32 * IN_PHASE_INC;
         let j = wrap_angle(tmp) * INV_PHASE_INC;
         let freq = i_f32 + j;
 
@@ -228,8 +238,8 @@ fn shift_frame<'a>(
 
         // DECODE
 
-        let delta = freq * PHASE_INC;
-        let arg = arg_obuf[i] + delta;
+        let out_delta = freq * out_phase_inc;
+        let arg = arg_obuf[i] + out_delta;
         arg_obuf[i] = wrap_angle(arg);
 
         let (im, re) = F32Ext::sin_cos(arg);
@@ -335,7 +345,7 @@ mod const_hamming {
 
         let mut i = 0;
         while i < FS {
-            out[i] = (hamming[i] * HOP_F32) / sq_sum;
+            out[i] = hamming[i] / sq_sum;
             i += 1;
         }
 
